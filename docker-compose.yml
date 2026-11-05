@@ -1,0 +1,61 @@
+name: helpdesk
+
+services:
+  call-gateway:
+    build:
+      context: .
+      dockerfile: services/call-gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      PUBLIC_BASE_URL: https://${NGROK_DOMAIN:?set NGROK_DOMAIN in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
+      TRANSFER_NUMBER: ${TRANSFER_NUMBER:-}
+      REALTIME_MODEL: ${REALTIME_MODEL:-}
+      REALTIME_VOICE: ${REALTIME_VOICE:-}
+      REALTIME_REASONING_EFFORT: ${REALTIME_REASONING_EFFORT:-}
+      TRANSCRIPTION_MODEL: ${TRANSCRIPTION_MODEL:-}
+      VAD_THRESHOLD: ${VAD_THRESHOLD:-}
+      VAD_PREFIX_PADDING_MS: ${VAD_PREFIX_PADDING_MS:-}
+      VAD_SILENCE_DURATION_MS: ${VAD_SILENCE_DURATION_MS:-}
+      MAX_CALL_SECONDS: ${MAX_CALL_SECONDS:-}
+      GOODBYE_LEAD_SECONDS: ${GOODBYE_LEAD_SECONDS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+      LOG_TRANSCRIPTS: ${LOG_TRANSCRIPTS:-}
+    volumes:
+      # Editing business.yaml only needs a restart, not a rebuild.
+      - ./config:/app/config:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - /nodejs/bin/node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  ngrok:
+    image: ngrok/ngrok:3
+    restart: unless-stopped
+    command:
+      - http
+      - call-gateway:8080
+      - --url=https://${NGROK_DOMAIN:?set NGROK_DOMAIN in .env}
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?set NGROK_AUTHTOKEN in .env}
+    ports:
+      # The inspector shows every request that reaches the tunnel.
+      - "127.0.0.1:4040:4040"
+    depends_on:
+      call-gateway:
+        condition: service_healthy
