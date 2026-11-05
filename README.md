@@ -1,8 +1,80 @@
 # AI Voice Helpdesk
 
-An AI agent that answers phone calls for a business. It speaks the caller's language, answers only from your own files, takes messages, and hands the call to a person when it can't help.
+An AI agent that answers your business phone. It speaks the caller's language, answers only from your own files, takes messages, and hands the call to a person when it can't help.
 
-There are three ways to run it, from no accounts at all to real phone calls.
+- **Multilingual:** replies in the language the caller speaks (built and tested for Albanian, English and German).
+- **Grounded:** answers come from your `knowledge/` files (`.md`, `.txt`, `.csv`, `.pdf`). If the files don't cover it, the agent says so instead of guessing.
+- **Takes messages:** callback requests are emailed to you and shown in the admin page.
+- **Human handoff:** if it can't help, or the AI fails mid-call, the caller is transferred to your phone.
+- **Observable:** transcripts, per-call cost, traces, metrics and alerts out of the box.
+- **Deployable:** Docker Compose for local use, a Helm chart for k3s, GitHub Actions with Trivy scanning for CI.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [How it fits together](#how-it-fits-together)
+- [Run modes](#run-modes)
+- [Real phone calls](#real-phone-calls)
+- [Using your real business](#using-your-real-business)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Kubernetes](#kubernetes)
+- [CI/CD](#cicd)
+- [Development](#development)
+
+## Quick start
+
+You need Docker and Node 24 or newer. No accounts are required for the first run.
+
+```powershell
+npm install
+npm run sim:up       # whole system with a fake AI
+npm run sim:call     # a scripted call through every service
+npm run sim:verify   # checks the call reached each service
+```
+
+Then open the admin page at <http://localhost:8082> (password `demo-password`) to see the call, its transcript and its cost. `npm run sim:down` stops everything.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    Caller([Caller]) --> Twilio
+    Twilio -->|webhook + audio| Ngrok[ngrok tunnel]
+    Ngrok --> GW[call-gateway]
+    GW <-->|realtime audio| OpenAI[OpenAI Realtime]
+    GW -->|search tool| KS[knowledge-service]
+    GW -->|call events| NATS[(NATS JetStream)]
+    NATS --> Worker[call-worker]
+    Worker --> PG[(Postgres + pgvector)]
+    Worker -->|callback email| SMTP[SMTP / Mailpit]
+    KS --> PG
+    Ingest[ingest-job] -->|rebuild index| PG
+    Admin[admin-ui] --> PG
+    GW & KS & Worker -.->|traces, metrics| Obs[Jaeger / Prometheus / Grafana]
+```
+
+| Part | Job |
+|---|---|
+| `call-gateway` | Takes Twilio's webhook and bridges call audio straight to OpenAI. Audio never goes through the broker. |
+| `knowledge-service` | Hybrid search over your files, in Postgres with pgvector. |
+| `ingest-job` | Rebuilds the index from `knowledge/` and swaps it in atomically. |
+| `call-worker` | Reads events from NATS JetStream, writes them to Postgres, emails callback messages. |
+| `admin-ui` | Password-protected pages for calls, transcripts, messages and cost. |
+| `tools/sim` | Fake OpenAI, fake Twilio, scripted caller and the browser phone. |
+| `packages/*` | Shared code: `shared` (events, metrics, telemetry), `broker`, `db`, `knowledge`. |
+
+**Database:** one PostgreSQL with the pgvector extension holds calls, transcripts, messages and the search index. It runs in Docker locally and should be a hosted Postgres in production.
+
+**Failures are designed for:**
+- If NATS is down, calls carry on and events queue in memory.
+- If OpenAI or the gateway fails mid-call, the caller goes to `TRANSFER_NUMBER`.
+- A message is only confirmed to the caller once the broker has stored it.
+- A failed event retries, then moves to a dead-letter stream (`HELPDESK_DLQ`).
+
+**Cost** is estimated per call from OpenAI's reported usage and the rates in `config/pricing.yaml`. Compare it with your OpenAI bill, and update the rates if they change.
+
+## Run modes
 
 | Mode | Command | You need | What it's for |
 |---|---|---|---|
@@ -10,16 +82,9 @@ There are three ways to run it, from no accounts at all to real phone calls.
 | Browser phone | `npm run phone:up` | An OpenAI key | Talk to the real AI through your laptop mic. No phone number. |
 | Real calls | `docker compose up` | OpenAI, Twilio and ngrok accounts | Real phone calls. |
 
-## Simulation: no accounts needed
+### Simulation
 
-```powershell
-npm install
-npm run sim:up
-npm run sim:call     # a scripted call through the whole system
-npm run sim:verify   # checks it reached every service
-```
-
-Then open these, all on your own machine:
+Everything below runs on your own machine:
 
 | Page | Address | Sign in |
 |---|---|---|
@@ -30,13 +95,11 @@ Then open these, all on your own machine:
 | Mailpit: callback emails | <http://localhost:8025> | |
 | Prometheus: raw metrics | <http://localhost:9090> | |
 
-`npm run sim:down` stops everything.
-
 The fake AI follows a simple script, so this tests the system around the AI and not the AI itself. Its answers do come from your real knowledge files, but it matches on spelling only, so a question in one language won't find an answer written in another.
 
-## Browser phone: real AI, no phone number
+### Browser phone
 
-Add your key to `.env` (copy `.env.example` if you don't have one), plus an admin password:
+Real AI, no phone number. Copy `.env.example` to `.env`, add your OpenAI key, and set an admin password:
 
 ```powershell
 npm run admin:hash -- "a password of your choice"
@@ -48,7 +111,7 @@ Put the output in `ADMIN_PASSWORD_HASH`, and any 32 or more random characters in
 npm run phone:up
 ```
 
-Open <http://localhost:9000>, allow the microphone and start a call. This is the cheapest way to judge the voice and the Albanian before you pay for a phone number.
+Open <http://localhost:9000>, allow the microphone and start a call. This is the cheapest way to judge the voice and the Albanian before you pay for a phone number. `npm run phone:down` stops it.
 
 ## Real phone calls
 
@@ -104,6 +167,8 @@ curl.exe -s -o NUL -w "%{http_code}" -X POST https://YOUR_NGROK_DOMAIN/incoming-
 
 **Note the `signedUrl` value** in the `media stream signature verified` log line on your first real call. Twilio's docs don't say which URL form it signs, and the gateway accepts each likely form until that's known.
 
+**Known behaviour:** speaking over the greeting cuts it off, including the AI notice.
+
 ## Using your real business
 
 1. Edit `config/business.yaml` for the name, description, languages and greeting.
@@ -111,7 +176,25 @@ curl.exe -s -o NUL -w "%{http_code}" -X POST https://YOUR_NGROK_DOMAIN/incoming-
 3. Run `docker compose run --rm ingest` to rebuild the index, then `docker compose restart call-gateway`.
 4. Put real caller questions in `knowledge/eval/questions.yaml`, including ones the files can't answer, and run `npm run eval:rag`. Raise `SEARCH_MIN_SIMILARITY` if it answers things it shouldn't, and lower it if it misses things it should find.
 
-## If something goes wrong
+The sample business is fictional (Demo Auto Service).
+
+## Configuration
+
+Settings live in `.env` (see `.env.example` for the full list).
+
+| Setting | What it does |
+|---|---|
+| `OPENAI_API_KEY` | Key for the Realtime API and embeddings |
+| `TWILIO_AUTH_TOKEN` | Used to verify that webhooks really come from Twilio |
+| `NGROK_AUTHTOKEN`, `NGROK_DOMAIN` | Tunnel to your machine (domain only, no `https://`) |
+| `TRANSFER_NUMBER` | Your phone, where calls are handed to a person |
+| `REALTIME_MODEL` | Voice model; a stronger one costs more |
+| `VAD_THRESHOLD`, `VAD_SILENCE_DURATION_MS` | How sensitive the agent is to noise and pauses |
+| `SEARCH_MIN_SIMILARITY` | How close a knowledge match must be to count as found |
+| `SMTP_URL`, `NOTIFY_EMAIL_TO`, `NOTIFY_EMAIL_FROM` | Where callback emails go (Mailpit by default) |
+| `ADMIN_PASSWORD_HASH`, `ADMIN_SESSION_SECRET` | Admin page login |
+
+## Troubleshooting
 
 Logs: `docker compose logs -f call-gateway`.
 
@@ -125,25 +208,6 @@ Logs: `docker compose logs -f call-gateway`.
 | Your phone never rings on a transfer | Check Voice Geographic Permissions in Twilio. |
 | knowledge-service stays unhealthy | Nothing is indexed yet, or the embedding model changed. Run `docker compose run --rm ingest`. |
 | A message shows "Email not sent" | Check `SMTP_URL` and the call-worker logs. It retries, then moves the event to the `HELPDESK_DLQ` stream. |
-
-**Known behaviour:** speaking over the greeting cuts it off, including the AI notice.
-
-## How it fits together
-
-| Part | Job |
-|---|---|
-| `call-gateway` | Takes Twilio's webhook and bridges call audio straight to OpenAI. Audio never goes through the broker. |
-| `knowledge-service` | Hybrid search over your files, in Postgres with pgvector |
-| `ingest-job` | Rebuilds the index from `knowledge/` and swaps it in atomically |
-| `call-worker` | Reads events from NATS JetStream, writes them to Postgres, emails callback messages |
-| `admin-ui` | Password-protected pages for calls, transcripts, messages and cost |
-| `tools/sim` | Fake OpenAI, fake Twilio, scripted caller and the browser phone |
-
-**Database:** one PostgreSQL with the pgvector extension holds calls, transcripts, messages and the search index. It runs in Docker locally and should be a hosted Postgres in production.
-
-**Failures are designed for:** if NATS is down, calls carry on and events queue in memory. If OpenAI or the gateway fails mid-call, the caller goes to `TRANSFER_NUMBER`. A message is only confirmed to the caller once the broker has stored it. A failed event retries, then moves to a dead-letter stream.
-
-**Cost** is estimated per call from OpenAI's reported usage and the rates in `config/pricing.yaml`. Compare it with your OpenAI bill, and update the rates if they change.
 
 ## Kubernetes
 
@@ -181,3 +245,5 @@ npm install
 npm run check              # lint, typecheck and unit tests
 npm run test:integration   # the same, plus real Postgres and NATS in Docker
 ```
+
+The repo is an npm workspace: `packages/*`, `services/*` and `tools/*`. Node 24 or newer is required.
