@@ -1,0 +1,181 @@
+{{- $gateway := .Values.callGateway }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: call-gateway
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "call-gateway" | nindent 4 }}
+spec:
+  replicas: {{ $gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "call-gateway" | nindent 6 }}
+  strategy:
+    rollingUpdate:
+      # Bring new pods up before old ones start draining, so capacity never dips.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "call-gateway" | nindent 8 }}
+      annotations:
+        {{- include "helpdesk.scrapeAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "helpdesk.podSecurity" . | nindent 8 }}
+      # A call in progress has to finish before the pod dies. The longest possible
+      # call plus the preStop wait and some margin, derived so the two can't drift.
+      terminationGracePeriodSeconds: {{ add $gateway.maxCallSeconds 90 }}
+      containers:
+        - name: call-gateway
+          image: {{ include "helpdesk.image" (dict "root" . "name" "call-gateway") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "helpdesk.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: PUBLIC_BASE_URL
+              value: {{ $gateway.publicBaseUrl | quote }}
+            - name: TRANSFER_NUMBER
+              value: {{ $gateway.transferNumber | quote }}
+            - name: REALTIME_MODEL
+              value: {{ $gateway.realtimeModel | quote }}
+            - name: TRANSCRIPTION_MODEL
+              value: {{ $gateway.transcriptionModel | quote }}
+            - name: MAX_CALL_SECONDS
+              value: {{ $gateway.maxCallSeconds | quote }}
+            - name: NATS_URL
+              value: nats://{{ .Release.Name }}-nats:4222
+            - name: KNOWLEDGE_SERVICE_URL
+              value: http://knowledge-service:8081
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- with $gateway.openaiRealtimeUrl }}
+            - name: OPENAI_REALTIME_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $gateway.twilioApiBaseUrl }}
+            - name: TWILIO_API_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- include "helpdesk.otelEnv" . | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "OPENAI_API_KEY") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "TWILIO_ACCOUNT_SID") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "TWILIO_AUTH_TOKEN") | nindent 12 }}
+          # Traffic stops first, so the app is only told to drain once no new calls
+          # can arrive. Distroless has no shell, so this uses the built-in sleep.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 1
+          resources:
+            {{- toYaml $gateway.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: call-gateway
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "call-gateway" | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: call-gateway
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+  {{- with $gateway.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ $gateway.ingress.className }}
+  {{- with $gateway.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ $gateway.ingress.host }}
+      secretName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ $gateway.ingress.host | quote }}
+      http:
+        paths:
+          # Only the two paths Twilio needs. /healthz and the rest stay internal.
+          - path: /incoming-call
+            pathType: Exact
+            backend:
+              service:
+                name: call-gateway
+                port:
+                  name: http
+          - path: /media-stream
+            pathType: Exact
+            backend:
+              service:
+                name: call-gateway
+                port:
+                  name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: call-gateway
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: call-gateway
+  minReplicas: {{ $gateway.autoscaling.minReplicas }}
+  maxReplicas: {{ $gateway.autoscaling.maxReplicas }}
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: helpdesk_active_calls
+        target:
+          type: AverageValue
+          averageValue: {{ $gateway.autoscaling.callsPerPod | quote }}
+  behavior:
+    scaleDown:
+      # Calls last minutes, so scaling down quickly only moves drains around.
+      stabilizationWindowSeconds: 600
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: call-gateway
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "call-gateway" | nindent 6 }}

@@ -1,0 +1,31 @@
+# Throwaway Postgres and NATS for `npm run test:integration`. Nothing is kept.
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17
+    environment:
+      POSTGRES_USER: helpdesk
+      POSTGRES_PASSWORD: helpdesk
+      POSTGRES_DB: helpdesk
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helpdesk"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["--jetstream", "--store_dir", "/tmp/nats", "--http_port", "8222"]
+    ports:
+      - "127.0.0.1:54222:4222"
+    tmpfs:
+      - /tmp/nats
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

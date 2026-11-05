@@ -1,0 +1,32 @@
+# Test questions for `npm run eval:rag`. These are never indexed as knowledge.
+# `source` is the file that holds the answer. Leave it out for a question the
+# files can't answer, which must come back as not found.
+#
+# Replace these with real questions from your callers when you swap in your data.
+
+questions:
+  # English
+  - { language: English, question: "What time do you open on Saturday?", source: faq.md }
+  - { language: English, question: "Where are you located?", source: faq.md }
+  - { language: English, question: "Can I pay in instalments?", source: faq.md }
+  - { language: English, question: "How much does an oil change cost?", source: prices.csv }
+  - { language: English, question: "What does it cost to store winter tyres?", source: prices.csv }
+  - { language: English, question: "How long is the warranty on repairs?", source: garantiebedingungen.pdf }
+  - { language: English, question: "Do you sell helicopters?" }
+  - { language: English, question: "What is the capital of Australia?" }
+
+  # Albanian
+  - { language: Albanian, question: "Sa zgjat ndërrimi i vajit?", source: sherbimet.md }
+  - { language: Albanian, question: "A e ruani gomat e dimrit gjatë verës?", source: sherbimet.md }
+  - { language: Albanian, question: "Sa kushton ndërrimi i vajit?", source: prices.csv }
+  - { language: Albanian, question: "Në çfarë ore hapeni të shtunën?", source: faq.md }
+  - { language: Albanian, question: "Ku ndodheni?", source: faq.md }
+  - { language: Albanian, question: "A rregulloni motoçikleta?", source: faq.md }
+  - { language: Albanian, question: "A shisni helikopterë?" }
+
+  # German
+  - { language: German, question: "Wie lange gilt die Garantie auf Reparaturen?", source: garantiebedingungen.pdf }
+  - { language: German, question: "Sind Bremsbeläge von der Garantie abgedeckt?", source: garantiebedingungen.pdf }
+  - { language: German, question: "Wann haben Sie am Samstag geöffnet?", source: faq.md }
+  - { language: German, question: "Was kostet ein Ölwechsel?", source: prices.csv }
+  - { language: German, question: "Verkaufen Sie Hubschrauber?" }

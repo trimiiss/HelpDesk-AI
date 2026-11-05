@@ -1,0 +1,15 @@
+# Used to estimate what each call cost. Rates change, so check them against
+# OpenAI's model pages now and then. Last checked on 2026-11-05.
+
+# USD per 1 million tokens.
+models:
+  gpt-realtime-2.1-mini:
+    text: { input: 0.60, cachedInput: 0.06, output: 2.40 }
+    audio: { input: 10.00, cachedInput: 0.30, output: 20.00 }
+  gpt-realtime-2.1:
+    text: { input: 4.00, cachedInput: 0.40, output: 24.00 }
+    audio: { input: 32.00, cachedInput: 0.40, output: 64.00 }
+
+# USD per minute of caller speech.
+transcription:
+  gpt-transcribe: { perMinute: 0.0045 }

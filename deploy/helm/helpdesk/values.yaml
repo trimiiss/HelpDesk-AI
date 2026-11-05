@@ -1,0 +1,317 @@
+# Production defaults. See values-k3d.yaml for local testing.
+
+image:
+  # CI sets the tag to the commit SHA.
+  registry: ghcr.io/OWNER/helpdesk
+  tag: latest
+  pullPolicy: IfNotPresent
+
+logLevel: info
+
+secrets:
+  # Create this Secret yourself, so real values never live in a values file.
+  # Keys: OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, DATABASE_URL,
+  # SMTP_URL, ADMIN_PASSWORD_HASH, ADMIN_SESSION_SECRET, GRAFANA_ADMIN_USER,
+  # GRAFANA_ADMIN_PASSWORD.
+  existingSecret: helpdesk-secrets
+  create: false
+  values: {}
+
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  openaiBaseUrl: ""
+
+callGateway:
+  replicas: 2
+  publicBaseUrl: https://helpdesk.example.com
+  transferNumber: ""
+  realtimeModel: gpt-realtime-2.1-mini
+  transcriptionModel: gpt-transcribe
+  # terminationGracePeriodSeconds is derived from this, so an active call always
+  # has time to finish before its pod is stopped.
+  maxCallSeconds: 600
+  openaiRealtimeUrl: ""
+  twilioApiBaseUrl: ""
+  ingress:
+    className: traefik
+    host: helpdesk.example.com
+    # Twilio needs a valid certificate. Supply the Secret that holds it.
+    tlsSecretName: helpdesk-tls
+    annotations: {}
+  autoscaling:
+    minReplicas: 2
+    maxReplicas: 10
+    # Each call holds two sockets and little else, but the audio must never stall.
+    callsPerPod: 20
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+knowledgeService:
+  replicas: 2
+  minSimilarity: 0.3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+
+callWorker:
+  replicas: 1
+  notifyEmailTo: owner@example.com
+  notifyEmailFrom: assistant@example.com
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+
+adminUi:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+ingest:
+  # /knowledge is baked into the image, so CI rebuilds it when the files change.
+  schedule: "0 3 * * *"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# For development only. Production points DATABASE_URL at an external Postgres.
+postgres:
+  enabled: false
+  image: pgvector/pgvector:0.8.7-pg17
+  password: helpdesk-dev
+  storage: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 384Mi
+
+jaeger:
+  image: jaegertracing/jaeger:2.23.0
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 384Mi
+
+mailpit:
+  enabled: false
+  image: axllent/mailpit:v1.33.0
+
+sim:
+  enabled: false
+
+networkPolicies:
+  enabled: true
+  # Where the ingress controller runs. These are the defaults on k3s.
+  ingressNamespace: kube-system
+  ingressPodName: traefik
+  # Used when postgres.enabled is false.
+  externalDatabaseCidr: 0.0.0.0/0
+  externalDatabasePort: 5432
+
+# --- Third-party charts -----------------------------------------------------
+
+nats:
+  natsBox:
+    enabled: false
+  config:
+    cluster:
+      enabled: false
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 1Gi
+  promExporter:
+    enabled: true
+  podTemplate:
+    merge:
+      metadata:
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "7777"
+
+opentelemetry-collector:
+  mode: deployment
+  image:
+    repository: otel/opentelemetry-collector-contrib
+  command:
+    name: otelcol-contrib
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  ports:
+    otlp:
+      enabled: false
+    otlp-http:
+      enabled: true
+    jaeger-compact:
+      enabled: false
+    jaeger-thrift:
+      enabled: false
+    jaeger-grpc:
+      enabled: false
+    zipkin:
+      enabled: false
+    metrics:
+      enabled: false
+  # Replaces the chart's default config completely, because Helm can't remove
+  # default keys from a subchart by setting them to null.
+  alternateConfig:
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        timeout: 2s
+    exporters:
+      otlp_grpc/jaeger:
+        endpoint: jaeger:4317
+        tls:
+          insecure: true
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [otlp_grpc/jaeger]
+
+prometheus:
+  alertmanager:
+    enabled: false
+  kube-state-metrics:
+    enabled: false
+  prometheus-node-exporter:
+    enabled: false
+  prometheus-pushgateway:
+    enabled: false
+  server:
+    retention: 15d
+    persistentVolume:
+      size: 4Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        memory: 512Mi
+  serverFiles:
+    prometheus.yml:
+      scrape_configs:
+        # Only this namespace, and only pods that ask to be scraped.
+        - job_name: pods
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                own_namespace: true
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+              regex: (.+);(\d+)
+              replacement: $1:$2
+              target_label: __address__
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+
+# Serves helpdesk_active_calls to the autoscaler.
+prometheus-adapter:
+  prometheus:
+    url: http://helpdesk-prometheus-server
+    port: 80
+  rules:
+    default: false
+    custom:
+      - seriesQuery: 'helpdesk_active_calls{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: ^(.*)$
+          as: $1
+        metricsQuery: sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)
+  resources:
+    requests:
+      cpu: 10m
+      memory: 48Mi
+    limits:
+      memory: 128Mi
+
+grafana:
+  admin:
+    existingSecret: helpdesk-secrets
+    userKey: GRAFANA_ADMIN_USER
+    passwordKey: GRAFANA_ADMIN_PASSWORD
+  rbac:
+    pspEnabled: false
+  testFramework:
+    enabled: false
+  resources:
+    requests:
+      cpu: 25m
+      memory: 128Mi
+    limits:
+      memory: 384Mi
+  env:
+    PROMETHEUS_URL: http://helpdesk-prometheus-server
+    JAEGER_URL: http://jaeger:16686
+    ALERT_EMAIL_TO: owner@example.com
+  grafana.ini:
+    users:
+      allow_sign_up: false
+  # Dashboards and alerts come from files/grafana, the same files Compose uses.
+  extraConfigmapMounts:
+    - name: grafana-datasources
+      mountPath: /etc/grafana/provisioning/datasources
+      configMap: grafana-datasources
+      readOnly: true
+    - name: grafana-dashboard-provider
+      mountPath: /etc/grafana/provisioning/dashboards
+      configMap: grafana-dashboard-provider
+      readOnly: true
+    - name: grafana-alerting
+      mountPath: /etc/grafana/provisioning/alerting
+      configMap: grafana-alerting
+      readOnly: true
+    - name: grafana-dashboards
+      mountPath: /var/lib/grafana/dashboards
+      configMap: grafana-dashboards
+      readOnly: true

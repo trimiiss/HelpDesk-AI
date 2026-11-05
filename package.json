@@ -8,20 +8,34 @@
   },
   "workspaces": [
     "packages/*",
-    "services/*"
+    "services/*",
+    "tools/*"
   ],
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b && tsc -p services/call-gateway/tsconfig.test.json",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run lint && npm run typecheck && npm test"
+    "test:integration": "node scripts/test-integration.mjs",
+    "check": "npm run lint && npm run typecheck && npm test",
+    "eval:rag": "tsx services/knowledge-service/src/eval.ts",
+    "admin:hash": "tsx services/admin-ui/src/hashPassword.ts",
+    "sim:up": "node scripts/up.mjs sim",
+    "sim:call": "docker compose --env-file deploy/sim/sim.env exec sim /nodejs/bin/node tools/sim/dist/fakeCall.js",
+    "sim:verify": "node scripts/verify-stack.mjs",
+    "sim:down": "docker compose --env-file deploy/sim/sim.env down",
+    "phone:up": "node scripts/up.mjs phone",
+    "phone:down": "docker compose --env-file .env --env-file deploy/sim/phone.env down"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.2",
     "eslint": "^10.14.0",
+    "pdf-lib": "^1.17.1",
+    "tsx": "^4.23.15",
     "typescript": "~6.0",
     "typescript-eslint": "^8.72.1",
     "vitest": "^5.1.0"

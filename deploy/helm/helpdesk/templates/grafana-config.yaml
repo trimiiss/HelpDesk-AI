@@ -1,0 +1,36 @@
+{{/* The same files Docker Compose mounts, so dashboards and alerts have one source. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "files/grafana/provisioning/datasources/*").AsConfig | indent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "files/grafana/provisioning/dashboards/*").AsConfig | indent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-alerting
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "files/grafana/provisioning/alerting/*").AsConfig | indent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+data:
+{{ (.Files.Glob "files/grafana/dashboards/*").AsConfig | indent 2 }}

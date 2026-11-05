@@ -1,0 +1,15 @@
+{
+  "name": "@helpdesk/ingest-job",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@helpdesk/db": "*",
+    "@helpdesk/knowledge": "*",
+    "@helpdesk/shared": "*",
+    "csv-parse": "^7.0.3",
+    "unpdf": "^2.1.0",
+    "zod": "^4.6.7"
+  }
+}

@@ -5,7 +5,15 @@ import { loadConfig } from '../src/config.js';
 import { createRealtimeConnector } from '../src/realtime.js';
 import { buildServer, type GatewayServer } from '../src/server.js';
 import { buildSessionUpdate } from '../src/session.js';
-import { audioOfMs, CALL_SID, signTwilio, silentLog, STREAM_SID } from './helpers.js';
+import {
+  audioOfMs,
+  CALL_SID,
+  fakeEvents,
+  fakeMetrics,
+  signTwilio,
+  silentLog,
+  STREAM_SID,
+} from './helpers.js';
 
 const AUTH_TOKEN = 'test-auth-token';
 const PUBLIC_URL = 'https://helpdesk.example.test';
@@ -24,6 +32,15 @@ function config(overrides: Record<string, string> = {}) {
     ...overrides,
   });
 }
+
+/** Everything a server needs besides config and the OpenAI connection. */
+const collaborators = () => ({
+  log: silentLog,
+  events: fakeEvents(),
+  metrics: fakeMetrics(),
+  searchKnowledge: vi.fn(async () => ({ found: false, results: [] })),
+  estimateCost: () => 0,
+});
 
 function formBody(params: Record<string, string>): string {
   return new URLSearchParams(params).toString();
@@ -66,8 +83,8 @@ describe('POST /incoming-call', () => {
   beforeEach(() => {
     const cfg = config();
     server = buildServer({
+      ...collaborators(),
       config: cfg,
-      log: silentLog,
       sessionUpdate: {},
       connectRealtime: vi.fn(),
       control: { transfer: vi.fn(), hangup: vi.fn() },
@@ -141,8 +158,8 @@ describe('POST /incoming-call', () => {
 
   it('hangs up cleanly on socket loss when no transfer number is set', async () => {
     const noTransfer = buildServer({
+      ...collaborators(),
       config: config({ TRANSFER_NUMBER: '' }),
-      log: silentLog,
       sessionUpdate: {},
       connectRealtime: vi.fn(),
       control: { transfer: vi.fn(), hangup: vi.fn() },
@@ -162,6 +179,16 @@ describe('POST /incoming-call', () => {
 
     expect(body).toContain('<Hangup/>');
     expect(body).not.toContain('<Dial>');
+  });
+
+  it('fails readiness while draining but stays alive', async () => {
+    server.startDraining();
+    expect((await server.app.inject({ method: 'GET', url: '/readyz' })).statusCode).toBe(503);
+    expect((await server.app.inject({ method: 'GET', url: '/healthz' })).statusCode).toBe(200);
+  });
+
+  it('is ready when not draining', async () => {
+    expect((await server.app.inject({ method: 'GET', url: '/readyz' })).statusCode).toBe(200);
   });
 
   it('reports health without a signature', async () => {
@@ -191,8 +218,8 @@ describe('/media-stream over real sockets', () => {
     const cfg = config();
     const { port } = openai.address() as AddressInfo;
     server = buildServer({
+      ...collaborators(),
       config: cfg,
-      log: silentLog,
       sessionUpdate: buildSessionUpdate(cfg, 'test instructions'),
       connectRealtime: createRealtimeConnector({
         url: `ws://127.0.0.1:${port}/v1/realtime`,

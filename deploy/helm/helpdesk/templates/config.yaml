@@ -1,0 +1,13 @@
+{{- if .Values.secrets.create }}
+# For local testing only. In production, secrets.existingSecret names a Secret
+# created outside this chart, so real values never pass through a values file.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: helpdesk-secrets
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{- toYaml .Values.secrets.values | nindent 2 }}
+{{- end }}

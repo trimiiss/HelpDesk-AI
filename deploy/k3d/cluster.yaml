@@ -1,0 +1,19 @@
+# A local k3s cluster, matching production. Traefik comes with k3s.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: helpdesk
+servers: 1
+agents: 0
+ports:
+  # Traefik, on http://localhost:8088
+  - port: 127.0.0.1:8088:80
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      # Not used here, and the Docker VM is small.
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*

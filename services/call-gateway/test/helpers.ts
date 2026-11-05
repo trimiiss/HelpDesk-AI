@@ -1,7 +1,8 @@
 import { createHmac } from 'node:crypto';
-import { createLogger } from '@helpdesk/shared';
+import { createLogger, type HelpdeskEvent } from '@helpdesk/shared';
 import { vi } from 'vitest';
 import { CallSession, type CallSessionDeps, type EndReason } from '../src/callSession.js';
+import type { SearchKnowledge } from '../src/knowledgeClient.js';
 import type { RealtimeEvent, RealtimeHandlers } from '../src/realtime.js';
 import type { TwilioOutbound } from '../src/twilioMessages.js';
 
@@ -15,7 +16,42 @@ export const TIMING = {
   goodbyeLeadMs: 30_000,
   sessionReadyTimeoutMs: 5_000,
   transferPlaybackTimeoutMs: 8_000,
+  messageSaveTimeoutMs: 3_000,
 };
+
+export function fakeMetrics() {
+  return {
+    callStarted: vi.fn(),
+    callEnded: vi.fn(),
+    firstAudio: vi.fn(),
+    toolCall: vi.fn(),
+    error: vi.fn(),
+  };
+}
+
+/** Collects events and lets a test decide whether the broker accepts them. */
+export function fakeEvents() {
+  const queued: HelpdeskEvent[] = [];
+  const headers: Record<string, string>[] = [];
+  return {
+    queued,
+    headers,
+    enqueue: vi.fn((event: HelpdeskEvent, eventHeaders: Record<string, string>) => {
+      queued.push(event);
+      headers.push(eventHeaders);
+    }),
+    publishNow: vi.fn(
+      async (event: HelpdeskEvent, _headers: Record<string, string>, _timeoutMs: number) => {
+        queued.push(event);
+      },
+    ),
+    ofType<T extends HelpdeskEvent['type']>(type: T) {
+      return queued.filter(
+        (event): event is Extract<HelpdeskEvent, { type: T }> => event.type === type,
+      );
+    },
+  };
+}
 
 export const SESSION_UPDATE = { type: 'session.update', session: { type: 'realtime' } };
 
@@ -56,8 +92,19 @@ export function createHarness(overrides: Partial<CallSessionDeps> = {}) {
     transfer: vi.fn(async (_callSid: string) => {}),
     hangup: vi.fn(async (_callSid: string) => {}),
   };
+  const events = fakeEvents();
+  const metrics = fakeMetrics();
+  const searchKnowledge = vi.fn<SearchKnowledge>(async () => ({
+    found: true,
+    results: [{ text: 'We open at 8.', source: 'faq.md' }],
+  }));
 
   const session = new CallSession({
+    events,
+    metrics,
+    searchKnowledge,
+    estimateCost: () => 0.25,
+    model: 'test-model',
     twilio: {
       send(message) {
         toTwilio.push(message);
@@ -100,6 +147,9 @@ export function createHarness(overrides: Partial<CallSessionDeps> = {}) {
   const harness = {
     session,
     control,
+    events,
+    metrics,
+    searchKnowledge,
     timeline,
     toTwilio,
     toOpenAI,
@@ -174,16 +224,31 @@ export function createHarness(overrides: Partial<CallSessionDeps> = {}) {
       }
     },
 
-    modelCallsTool(name: string, callId = 'call_1', status = 'completed') {
+    modelCallsTool(
+      name: string,
+      callId = 'call_1',
+      status = 'completed',
+      args: Record<string, unknown> = {},
+    ) {
       openai({ type: 'response.created', response: { id: `resp_${callId}` } });
       openai({
         type: 'response.done',
         response: {
           id: `resp_${callId}`,
           status,
-          output: [{ type: 'function_call', name, call_id: callId, arguments: '{}' }],
+          output: [
+            { type: 'function_call', name, call_id: callId, arguments: JSON.stringify(args) },
+          ],
         },
       });
+    },
+
+    /** What the model was told a tool returned. */
+    toolOutput(index = 0): Record<string, unknown> {
+      const outputs = toOpenAI
+        .map((event) => event.item as { type?: string; output?: string } | undefined)
+        .filter((item) => item?.type === 'function_call_output');
+      return JSON.parse(outputs[index]?.output ?? 'null') as Record<string, unknown>;
     },
 
     /** Runs the "connecting you now" response that follows a transfer tool call. */

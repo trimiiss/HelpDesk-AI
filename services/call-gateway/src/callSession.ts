@@ -1,14 +1,41 @@
-import { maskPhone, type Logger } from '@helpdesk/shared';
+import {
+  contextFromHeaders,
+  createEvent,
+  emptyUsage,
+  maskPhone,
+  SpanKind,
+  startSpan,
+  traceHeaders,
+  withSpan,
+  type CallUsage,
+  type Context,
+  type HelpdeskEvent,
+  type Logger,
+  type Span,
+} from '@helpdesk/shared';
 import type { CallControl } from './callControl.js';
+import type { SearchKnowledge } from './knowledgeClient.js';
+import type { CallMetrics } from './metrics.js';
 import type { RealtimeConnection, RealtimeConnector, RealtimeEvent } from './realtime.js';
-import { TRANSFER_TOOL } from './session.js';
+import { MESSAGE_TOOL, SEARCH_TOOL, TRANSFER_TOOL } from './session.js';
 import type { TwilioInbound, TwilioOutbound } from './twilioMessages.js';
+import {
+  addResponseUsage,
+  addTranscriptionUsage,
+  type CostEstimator,
+  type ResponseUsage,
+  type TranscriptionUsage,
+} from './usage.js';
 
 /** G.711 mu-law is 8000 one-byte samples per second. */
 const BYTES_PER_MS = 8;
 
 /** After a REST update, how long to let Twilio close the stream before we do. */
 const TWILIO_CLOSE_TIMEOUT_MS = 5000;
+
+const MAX_NAME_LENGTH = 200;
+const MAX_PHONE_LENGTH = 40;
+const MAX_MESSAGE_LENGTH = 2000;
 
 const CALL_CONNECTED_MESSAGE = 'The call has connected. Say your greeting now.';
 const GOODBYE_MESSAGE =
@@ -28,6 +55,7 @@ export interface CallTiming {
   goodbyeLeadMs: number;
   sessionReadyTimeoutMs: number;
   transferPlaybackTimeoutMs: number;
+  messageSaveTimeoutMs: number;
 }
 
 export interface TwilioPeer {
@@ -35,12 +63,27 @@ export interface TwilioPeer {
   close(): void;
 }
 
+/** Where events go. Only `publishNow` can be awaited, and only when a caller depends on the result. */
+export interface CallEvents {
+  enqueue(event: HelpdeskEvent, headers: Record<string, string>): void;
+  publishNow(
+    event: HelpdeskEvent,
+    headers: Record<string, string>,
+    timeoutMs: number,
+  ): Promise<void>;
+}
+
 export interface CallSessionDeps {
   twilio: TwilioPeer;
   connectRealtime: RealtimeConnector;
   control: CallControl;
+  events: CallEvents;
+  searchKnowledge: SearchKnowledge;
+  metrics: CallMetrics;
+  estimateCost: CostEstimator;
   /** Built once at startup and identical for every call, so the prompt cache can be reused. */
   sessionUpdate: Record<string, unknown>;
+  model: string;
   transferAvailable: boolean;
   timing: CallTiming;
   logTranscripts: boolean;
@@ -65,11 +108,19 @@ interface FunctionCallItem {
   arguments?: string;
 }
 
+interface ResponseItem {
+  type?: string;
+  id?: string;
+  role?: string;
+  content?: { transcript?: string }[];
+}
+
 interface ResponseBody {
   id?: string;
   status?: string;
   status_details?: unknown;
-  output?: { type?: string }[];
+  output?: ResponseItem[];
+  usage?: ResponseUsage;
 }
 
 /** Decoded size of a base64 string, without decoding it on the audio path. */
@@ -78,13 +129,25 @@ function base64ByteLength(value: string): number {
   return (value.length * 3) / 4 - padding;
 }
 
+function parseArguments(raw: string | undefined): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '{}');
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+const textField = (value: unknown, maxLength: number): string =>
+  typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+
 /**
  * Bridges one phone call between Twilio and the OpenAI Realtime API.
  *
  * Audio passes through as base64 without being decoded, because both sides use
- * G.711 mu-law. Nothing on the audio path awaits anything. Only the REST calls
- * that end or transfer a call are asynchronous, and they run once the bridge is
- * no longer carrying audio.
+ * G.711 mu-law. Nothing on the audio path awaits anything: events go to an
+ * in-memory queue, and tools run off to the side. Only the REST calls that end
+ * or transfer a call wait for a reply, and by then the bridge carries no audio.
  */
 export class CallSession {
   private readonly log: Logger;
@@ -93,6 +156,7 @@ export class CallSession {
   private realtime: RealtimeConnection | undefined;
   private callSid: string | undefined;
   private streamSid: string | undefined;
+  private callerNumber: string | undefined;
   private sessionReady = false;
   private startedAt: number | undefined;
 
@@ -116,6 +180,16 @@ export class CallSession {
   private transferState: TransferState = 'idle';
   private transferTimer: NodeJS.Timeout | undefined;
   private readonly setupTimer: NodeJS.Timeout;
+
+  private callSpan: Span | undefined;
+  private callContext: Context | undefined;
+  private readonly usage: CallUsage = emptyUsage();
+  private speechStoppedAt: number | undefined;
+
+  // Transcripts finish in any order, so each item's position is noted when it first appears.
+  private readonly itemSequence = new Map<string, number>();
+  private readonly publishedTranscripts = new Set<string>();
+  private readonly truncatedItems = new Set<string>();
 
   constructor(private readonly deps: CallSessionDeps) {
     this.log = deps.log;
@@ -163,12 +237,33 @@ export class CallSession {
   private onStart(message: Extract<TwilioInbound, { event: 'start' }>): void {
     if (this.callSid) return;
 
-    this.callSid = message.start.callSid;
+    const { callSid } = message.start;
+    this.callSid = callSid;
     this.streamSid = message.start.streamSid ?? message.streamSid;
     this.startedAt = Date.now();
 
-    const { from, to } = message.start.customParameters ?? {};
-    this.log.info({ callSid: this.callSid, from: maskPhone(from), to }, 'call started');
+    const { from, to, traceparent } = message.start.customParameters ?? {};
+    this.callerNumber = from;
+    this.log.info({ callSid, from: maskPhone(from), to }, 'call started');
+
+    // The webhook may have run on another pod, so its trace arrives as a parameter.
+    const { span, context } = startSpan('call', {
+      kind: SpanKind.SERVER,
+      parent: traceparent ? contextFromHeaders({ traceparent }) : undefined,
+      attributes: { 'call.sid': callSid },
+    });
+    this.callSpan = span;
+    this.callContext = context;
+
+    this.deps.metrics.callStarted();
+    this.publish(
+      createEvent('call.started', callSid, {
+        from,
+        to,
+        model: this.deps.model,
+        traceId: span.spanContext().traceId,
+      }),
+    );
 
     const { maxCallMs, goodbyeLeadMs } = this.deps.timing;
     this.schedule(() => this.sayGoodbye(), maxCallMs - goodbyeLeadMs);
@@ -210,19 +305,32 @@ export class CallSession {
         this.onAudioDelta(event);
         break;
       case 'input_audio_buffer.speech_started':
+        this.speechStoppedAt = undefined;
         this.onCallerSpeechStarted();
+        break;
+      case 'input_audio_buffer.speech_stopped':
+        this.speechStoppedAt = Date.now();
+        break;
+      case 'input_audio_buffer.committed':
+        this.noteItem(event.item_id);
+        break;
+      case 'conversation.item.added':
+      case 'response.output_item.added':
+        this.noteItem((event.item as ResponseItem | undefined)?.id);
         break;
       case 'response.done':
         this.onResponseDone((event.response ?? {}) as ResponseBody);
         break;
       case 'conversation.item.input_audio_transcription.completed':
-        this.logTranscript('caller', event.transcript);
+        addTranscriptionUsage(this.usage, event.usage as TranscriptionUsage | undefined);
+        this.publishTranscript('caller', event.item_id, event.transcript);
         break;
       case 'response.output_audio_transcript.done':
-        this.logTranscript('agent', event.transcript);
+        this.publishTranscript('agent', event.item_id, event.transcript);
         break;
       case 'conversation.item.input_audio_transcription.failed':
         this.log.warn({ error: event.error }, 'caller transcription failed');
+        this.deps.metrics.error('transcription');
         break;
       case 'error':
         this.onRealtimeError(event);
@@ -250,6 +358,7 @@ export class CallSession {
     }
 
     this.log.error({ error: event.error }, 'realtime error');
+    this.deps.metrics.error('realtime');
     // A rejected session.update would leave the wrong audio format on the line.
     if (!this.sessionReady) this.failToHuman(`session rejected: ${error.message ?? 'unknown'}`);
   }
@@ -259,6 +368,11 @@ export class CallSession {
     if (typeof delta !== 'string' || !this.streamSid) return;
     // Audio from a cancelled response can still arrive just after the barge-in.
     if (typeof responseId === 'string' && this.droppedResponses.has(responseId)) return;
+
+    if (this.speechStoppedAt !== undefined) {
+      this.deps.metrics.firstAudio((Date.now() - this.speechStoppedAt) / 1000);
+      this.speechStoppedAt = undefined;
+    }
 
     if (typeof itemId === 'string' && this.assistant?.itemId !== itemId) {
       // A new item queues behind any audio Twilio is still playing.
@@ -312,6 +426,7 @@ export class CallSession {
         content_index: 0,
         audio_end_ms: Math.max(0, Math.min(Math.floor(heardMs), sentMs)),
       });
+      this.truncatedItems.add(this.assistant.itemId);
     }
 
     this.assistant = undefined;
@@ -322,9 +437,19 @@ export class CallSession {
     this.responseActive = false;
     this.currentResponseId = undefined;
     if (response.id) this.droppedResponses.delete(response.id);
+    addResponseUsage(this.usage, response.usage);
 
     if (response.status === 'failed') {
       this.log.error({ details: response.status_details }, 'realtime response failed');
+      this.deps.metrics.error('realtime_response');
+    }
+
+    // An interrupted response may never send its transcript event, so collect it here.
+    for (const item of response.output ?? []) {
+      if (item.type === 'message' && item.role === 'assistant') {
+        const text = item.content?.map((part) => part.transcript ?? '').join(' ');
+        this.publishTranscript('agent', item.id, text);
+      }
     }
 
     // The response that follows a transfer tool call is the "connecting you" line.
@@ -348,19 +473,96 @@ export class CallSession {
   }
 
   private runTools(calls: FunctionCallItem[]): void {
+    const pending: Promise<void>[] = [];
+
     for (const call of calls) {
-      if (call.name === TRANSFER_TOOL) {
-        this.startTransfer(call);
-      } else {
-        this.log.warn({ tool: call.name }, 'model called an unknown tool');
-        this.sendToolOutput(call, { ok: false, error: 'unknown_tool' });
+      switch (call.name) {
+        case TRANSFER_TOOL:
+          this.startTransfer(call);
+          break;
+        case SEARCH_TOOL:
+          pending.push(this.runSlowTool(call, (args) => this.searchKnowledge(args)));
+          break;
+        case MESSAGE_TOOL:
+          pending.push(this.runSlowTool(call, (args) => this.takeMessage(args)));
+          break;
+        default:
+          this.log.warn({ tool: call.name }, 'model called an unknown tool');
+          this.deps.metrics.toolCall('unknown', 'error', 0);
+          this.sendToolOutput(call, { ok: false, error: 'unknown_tool' });
       }
     }
-    this.requestResponse();
+
+    if (pending.length === 0) {
+      this.requestResponse();
+      return;
+    }
+
+    // These run beside the audio bridge, so the caller can keep talking meanwhile.
+    void Promise.all(pending).then(() => {
+      if (!this.ended && !this.leaving) this.requestResponse();
+    });
+  }
+
+  private async runSlowTool(
+    call: FunctionCallItem,
+    run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  ): Promise<void> {
+    const tool = call.name ?? 'unknown';
+    const started = Date.now();
+
+    const output = await withSpan(`tool ${tool}`, { parent: this.callContext }, async (span) => {
+      const result = await run(parseArguments(call.arguments));
+      if (result.error) span.setAttribute('tool.error', String(result.error));
+      return result;
+    }).catch((error: unknown) => {
+      this.log.error({ err: error, tool }, 'tool failed');
+      return { ok: false, error: 'tool_failed' };
+    });
+
+    this.deps.metrics.toolCall(tool, output.error ? 'error' : 'ok', (Date.now() - started) / 1000);
+    if (output.error) this.deps.metrics.error(`tool_${tool}`);
+    if (!this.ended && !this.leaving) this.sendToolOutput(call, output);
+  }
+
+  private async searchKnowledge(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const query = textField(args.query, 500);
+    if (!query) return { found: false, results: [], error: 'empty_query' };
+
+    try {
+      return { ...(await this.deps.searchKnowledge(query)) };
+    } catch (error) {
+      this.log.error({ err: error }, 'knowledge search failed');
+      return { found: false, results: [], error: 'search_unavailable' };
+    }
+  }
+
+  /** The agent only tells the caller it worked if the broker confirmed it stored the message. */
+  private async takeMessage(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const name = textField(args.name, MAX_NAME_LENGTH);
+    const message = textField(args.message, MAX_MESSAGE_LENGTH);
+    const phone = textField(args.phone, MAX_PHONE_LENGTH) || this.callerNumber;
+
+    if (!name || !message) return { ok: false, error: 'missing_name_or_message' };
+    if (!phone) return { ok: false, error: 'missing_phone' };
+    if (!this.callSid) return { ok: false, error: 'not_saved' };
+
+    try {
+      await this.deps.events.publishNow(
+        createEvent('message.taken', this.callSid, { name, phone, message }),
+        traceHeaders(this.callContext),
+        this.deps.timing.messageSaveTimeoutMs,
+      );
+      return { ok: true };
+    } catch (error) {
+      this.log.error({ err: error }, 'could not save message');
+      return { ok: false, error: 'not_saved' };
+    }
   }
 
   private startTransfer(call: FunctionCallItem): void {
     if (!this.deps.transferAvailable) {
+      this.deps.metrics.toolCall(TRANSFER_TOOL, 'unavailable', 0);
       this.sendToolOutput(call, { ok: false, error: 'transfer_unavailable' });
       return;
     }
@@ -369,7 +571,14 @@ export class CallSession {
     if (this.transferState !== 'idle') return;
 
     this.log.info({ callSid: this.callSid }, 'transfer requested');
+    this.deps.metrics.toolCall(TRANSFER_TOOL, 'ok', 0);
     this.transferState = 'announcing';
+
+    if (this.callSid) {
+      const reason = textField(parseArguments(call.arguments).reason, MAX_NAME_LENGTH);
+      this.publish(createEvent('transfer.requested', this.callSid, { reason: reason || undefined }));
+    }
+
     // Marks can be lost, so a stuck announcement must not strand the caller.
     this.transferTimer = this.schedule(
       () => this.endViaTwilio('transferred', 'transfer_failed'),
@@ -400,6 +609,7 @@ export class CallSession {
   private failToHuman(detail: string): void {
     if (this.ended || this.leaving) return;
     this.log.error({ detail }, 'AI session failed, handing over the call');
+    this.deps.metrics.error('realtime_session');
 
     if (!this.callSid) {
       this.end('setup_failed');
@@ -440,6 +650,7 @@ export class CallSession {
       },
       (error: unknown) => {
         this.log.error({ err: error }, 'Twilio call update failed');
+        this.deps.metrics.error('twilio_rest');
         // Closing the stream lets the <Dial> or <Hangup> after <Connect> take over.
         this.end(failure);
       },
@@ -458,7 +669,60 @@ export class CallSession {
 
     const durationMs = this.startedAt === undefined ? 0 : Date.now() - this.startedAt;
     this.log.info({ callSid: this.callSid, reason, durationMs }, 'call ended');
+
+    if (this.callSid) {
+      const costUsd = this.deps.estimateCost(this.usage);
+      this.deps.metrics.callEnded(reason, durationMs / 1000, costUsd, this.usage);
+      this.publish(
+        createEvent('call.ended', this.callSid, {
+          reason,
+          durationMs,
+          usage: this.usage,
+          costUsd,
+          traceId: this.callSpan?.spanContext().traceId,
+        }),
+      );
+      this.callSpan?.setAttributes({
+        'call.end_reason': reason,
+        'call.duration_ms': durationMs,
+        'call.cost_usd': costUsd,
+      });
+      this.callSpan?.end();
+    }
+
     this.deps.onEnd?.(reason);
+  }
+
+  private publish(event: HelpdeskEvent): void {
+    this.deps.events.enqueue(event, traceHeaders(this.callContext));
+  }
+
+  /** Numbers items in the order they first appear in the conversation. */
+  private noteItem(itemId: unknown): void {
+    if (typeof itemId === 'string' && !this.itemSequence.has(itemId)) {
+      this.itemSequence.set(itemId, this.itemSequence.size + 1);
+    }
+  }
+
+  private publishTranscript(role: 'caller' | 'agent', itemId: unknown, text: unknown): void {
+    if (typeof itemId !== 'string' || typeof text !== 'string') return;
+    const transcript = text.trim();
+    if (!transcript || !this.callSid || this.publishedTranscripts.has(itemId)) return;
+
+    this.publishedTranscripts.add(itemId);
+    this.noteItem(itemId);
+
+    if (this.deps.logTranscripts) this.log.info({ role, transcript }, 'transcript');
+
+    this.publish(
+      createEvent('transcript.completed', this.callSid, {
+        itemId,
+        role,
+        text: transcript,
+        sequence: this.itemSequence.get(itemId) ?? 0,
+        interrupted: this.truncatedItems.has(itemId),
+      }),
+    );
   }
 
   private requestResponse(): void {
@@ -488,10 +752,6 @@ export class CallSession {
         output: JSON.stringify(output),
       },
     });
-  }
-
-  private logTranscript(role: 'caller' | 'agent', transcript: unknown): void {
-    if (this.deps.logTranscripts) this.log.info({ role, transcript }, 'transcript');
   }
 
   private schedule(callback: () => void, delayMs: number): NodeJS.Timeout {

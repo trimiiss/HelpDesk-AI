@@ -7,4 +7,6 @@
 .env
 .env.*
 *.md
+!knowledge/**/*.md
 deploy
+scripts

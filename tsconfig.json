@@ -1,7 +1,35 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/shared" },
-    { "path": "services/call-gateway" }
+    {
+      "path": "packages/shared"
+    },
+    {
+      "path": "packages/broker"
+    },
+    {
+      "path": "packages/db"
+    },
+    {
+      "path": "packages/knowledge"
+    },
+    {
+      "path": "services/call-gateway"
+    },
+    {
+      "path": "services/knowledge-service"
+    },
+    {
+      "path": "services/ingest-job"
+    },
+    {
+      "path": "services/call-worker"
+    },
+    {
+      "path": "services/admin-ui"
+    },
+    {
+      "path": "tools/sim"
+    }
   ]
 }

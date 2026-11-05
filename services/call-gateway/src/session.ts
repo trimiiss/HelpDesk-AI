@@ -1,11 +1,30 @@
 import type { GatewayConfig } from './config.js';
 
+export const SEARCH_TOOL = 'search_knowledge';
 export const TRANSFER_TOOL = 'transfer_to_human';
+export const MESSAGE_TOOL = 'take_message';
 
 /** Twilio's bidirectional streams carry 8 kHz G.711 mu-law, which the GA Realtime API names audio/pcmu. */
 const TELEPHONY_AUDIO = { type: 'audio/pcmu' };
 
 const tools = [
+  {
+    type: 'function',
+    name: SEARCH_TOOL,
+    description:
+      'Search the business information: services, prices, opening hours, policies. Call this before answering any question about the business.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: "The caller's question, in the words and language they used.",
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
   {
     type: 'function',
     name: TRANSFER_TOOL,
@@ -19,6 +38,24 @@ const tools = [
           description: 'A few words on why the caller needs a person.',
         },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: MESSAGE_TOOL,
+    description: 'Save a message for the staff to call the caller back.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: "The caller's name." },
+        phone: {
+          type: 'string',
+          description: 'The number to call back. Leave empty to use the number they are calling from.',
+        },
+        message: { type: 'string', description: 'What the caller wants, in their own words.' },
+      },
+      required: ['name', 'message'],
       additionalProperties: false,
     },
   },

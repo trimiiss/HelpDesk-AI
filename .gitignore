@@ -8,3 +8,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Downloaded from the versions pinned in Chart.lock.
+deploy/helm/helpdesk/charts/

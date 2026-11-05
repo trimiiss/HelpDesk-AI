@@ -1,0 +1,188 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowledge-service
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "knowledge-service" | nindent 4 }}
+spec:
+  replicas: {{ .Values.knowledgeService.replicas }}
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "knowledge-service" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "knowledge-service" | nindent 8 }}
+      annotations:
+        {{- include "helpdesk.scrapeAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "helpdesk.podSecurity" . | nindent 8 }}
+      containers:
+        - name: knowledge-service
+          image: {{ include "helpdesk.image" (dict "root" . "name" "knowledge-service") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "helpdesk.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: SEARCH_MIN_SIMILARITY
+              value: {{ .Values.knowledgeService.minSimilarity | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- include "helpdesk.embeddingEnv" . | nindent 12 }}
+            {{- include "helpdesk.otelEnv" . | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "DATABASE_URL") | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.knowledgeService.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowledge-service
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "knowledge-service" | nindent 4 }}
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: call-worker
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "call-worker" | nindent 4 }}
+spec:
+  replicas: {{ .Values.callWorker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "call-worker" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "call-worker" | nindent 8 }}
+      annotations:
+        {{- include "helpdesk.scrapeAnnotations" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "helpdesk.podSecurity" . | nindent 8 }}
+      containers:
+        - name: call-worker
+          image: {{ include "helpdesk.image" (dict "root" . "name" "call-worker") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "helpdesk.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: NATS_URL
+              value: nats://{{ .Release.Name }}-nats:4222
+            - name: NOTIFY_EMAIL_TO
+              value: {{ .Values.callWorker.notifyEmailTo | quote }}
+            - name: NOTIFY_EMAIL_FROM
+              value: {{ .Values.callWorker.notifyEmailFrom | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- include "helpdesk.otelEnv" . | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "DATABASE_URL") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "SMTP_URL") | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.callWorker.resources | nindent 12 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-ui
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "admin-ui" | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "admin-ui" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "admin-ui" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "helpdesk.podSecurity" . | nindent 8 }}
+      containers:
+        - name: admin-ui
+          image: {{ include "helpdesk.image" (dict "root" . "name" "admin-ui") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "helpdesk.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8082
+          env:
+            # Reached with kubectl port-forward, which is plain HTTP on localhost.
+            - name: ADMIN_COOKIE_SECURE
+              value: "false"
+            - name: JAEGER_UI_URL
+              value: http://localhost:16686
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "DATABASE_URL") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "ADMIN_PASSWORD_HASH") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "ADMIN_SESSION_SECRET") | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.adminUi.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-ui
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "admin-ui" | nindent 4 }}
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http

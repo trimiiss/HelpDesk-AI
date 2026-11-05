@@ -1,0 +1,70 @@
+# Local testing on k3d, with the fake AI and fake Twilio and no accounts.
+# Sized for a small Docker Desktop VM.
+
+image:
+  registry: helpdesk
+  tag: dev
+  pullPolicy: Never
+
+logLevel: info
+
+secrets:
+  existingSecret: ""
+  create: true
+  values:
+    OPENAI_API_KEY: sim-key
+    TWILIO_ACCOUNT_SID: AC00000000000000000000000000000000
+    TWILIO_AUTH_TOKEN: sim-token
+    DATABASE_URL: postgres://helpdesk:helpdesk-dev@postgres:5432/helpdesk
+    SMTP_URL: smtp://mailpit:1025
+    # up.sh fills in ADMIN_PASSWORD_HASH from deploy/sim/sim.env.
+    ADMIN_SESSION_SECRET: sim-session-secret-not-for-real-use
+    GRAFANA_ADMIN_USER: admin
+    GRAFANA_ADMIN_PASSWORD: admin
+
+embedding:
+  provider: local
+
+callGateway:
+  replicas: 1
+  publicBaseUrl: https://helpdesk.sim.invalid
+  transferNumber: "+10000000003"
+  # Longer than usual, so the long-call test can run past the default 10 minutes.
+  maxCallSeconds: 700
+  openaiRealtimeUrl: ws://sim:9000/v1/realtime
+  twilioApiBaseUrl: http://sim:9000
+  ingress:
+    host: helpdesk.sim.invalid
+    tlsSecretName: ""
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 3
+    callsPerPod: 5
+
+knowledgeService:
+  replicas: 1
+  minSimilarity: 0.2
+
+postgres:
+  enabled: true
+
+mailpit:
+  enabled: true
+
+sim:
+  enabled: true
+
+grafana:
+  env:
+    PROMETHEUS_URL: http://helpdesk-prometheus-server
+    JAEGER_URL: http://jaeger:16686
+    ALERT_EMAIL_TO: owner@helpdesk.test
+    GF_SMTP_ENABLED: "true"
+    GF_SMTP_HOST: mailpit:1025
+    GF_SMTP_FROM_ADDRESS: grafana@helpdesk.test
+
+prometheus:
+  server:
+    persistentVolume:
+      enabled: false
+    retention: 1d

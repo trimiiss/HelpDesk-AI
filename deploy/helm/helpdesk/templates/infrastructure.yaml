@@ -1,0 +1,294 @@
+{{- if .Values.postgres.enabled }}
+# For development only. Production uses an external Postgres with pgvector.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "postgres" | nindent 4 }}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "postgres" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "postgres" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POSTGRES_USER
+              value: helpdesk
+            - name: POSTGRES_DB
+              value: helpdesk
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.password | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "helpdesk"]
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "postgres" | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "jaeger" | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "jaeger" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "jaeger" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jaeger
+          image: {{ .Values.jaeger.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: ui
+              containerPort: 16686
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          readinessProbe:
+            tcpSocket:
+              port: ui
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.jaeger.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "jaeger" | nindent 4 }}
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: ui
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+{{- if .Values.mailpit.enabled }}
+---
+# Catches every email in development, so nothing leaves the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "mailpit" | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "mailpit" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "mailpit" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mailpit
+          image: {{ .Values.mailpit.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: smtp
+              containerPort: 1025
+            - name: ui
+              containerPort: 8025
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "mailpit" | nindent 4 }}
+  ports:
+    - name: smtp
+      port: 1025
+      targetPort: smtp
+    - name: ui
+      port: 8025
+      targetPort: ui
+{{- end }}
+{{- if .Values.sim.enabled }}
+---
+# Fake OpenAI and Twilio, for testing the chart without accounts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "sim" | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "helpdesk.selector" "sim" | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "helpdesk.labels" . | nindent 8 }}
+        {{- include "helpdesk.selector" "sim" | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "helpdesk.podSecurity" . | nindent 8 }}
+      containers:
+        - name: sim
+          image: {{ include "helpdesk.image" (dict "root" . "name" "sim") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "helpdesk.containerSecurity" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: GATEWAY_URL
+              value: http://call-gateway:8080
+            - name: PUBLIC_BASE_URL
+              value: {{ .Values.callGateway.publicBaseUrl | quote }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "TWILIO_ACCOUNT_SID") | nindent 12 }}
+            {{- include "helpdesk.secretEnv" (dict "root" . "name" "TWILIO_AUTH_TOKEN") | nindent 12 }}
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sim
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "helpdesk.selector" "sim" | nindent 4 }}
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+{{- end }}

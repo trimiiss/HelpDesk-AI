@@ -1,0 +1,22 @@
+apiVersion: v2
+name: helpdesk
+description: AI voice helpdesk with its messaging, tracing, metrics and dashboards
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: nats
+    version: 2.15.2
+    repository: https://nats-io.github.io/k8s/helm/charts/
+  - name: opentelemetry-collector
+    version: 0.178.2
+    repository: https://open-telemetry.github.io/opentelemetry-helm-charts
+  - name: prometheus
+    version: 29.40.3
+    repository: https://prometheus-community.github.io/helm-charts
+  - name: prometheus-adapter
+    version: 5.4.0
+    repository: https://prometheus-community.github.io/helm-charts
+  - name: grafana
+    version: 14.4.0
+    repository: https://grafana-community.github.io/helm-charts

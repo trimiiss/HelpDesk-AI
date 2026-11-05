@@ -1,0 +1,15 @@
+{
+  "name": "@helpdesk/call-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "dependencies": {
+    "@helpdesk/broker": "*",
+    "@helpdesk/db": "*",
+    "@helpdesk/shared": "*",
+    "nodemailer": "^10.3.1",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  }
+}

@@ -1,16 +1,56 @@
+# The full system on one machine. Three ways to run it:
+#
+#   npm run sim:up      No accounts. Fake AI, fake Twilio. See deploy/sim/sim.env.
+#   npm run phone:up    Real AI through a browser. Needs only OPENAI_API_KEY.
+#   docker compose up   Real phone calls. Needs a filled-in .env.
+
 name: helpdesk
 
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 5s
+
+x-database: &database
+  DATABASE_URL: postgres://helpdesk:${POSTGRES_PASSWORD:-helpdesk-dev}@postgres:5432/helpdesk
+
+x-embeddings: &embeddings
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+
+x-tracing: &tracing
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+
 services:
+  # --- Our services ---------------------------------------------------------
+
   call-gateway:
+    <<: *hardened
     build:
       context: .
-      dockerfile: services/call-gateway/Dockerfile
-    restart: unless-stopped
+      target: service
+      args:
+        SERVICE_DIR: services/call-gateway
+    image: helpdesk/call-gateway:dev
     environment:
+      <<: *tracing
       PUBLIC_BASE_URL: https://${NGROK_DOMAIN:?set NGROK_DOMAIN in .env}
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      OPENAI_REALTIME_URL: ${OPENAI_REALTIME_URL:-}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
+      TWILIO_API_BASE_URL: ${TWILIO_API_BASE_URL:-}
       TRANSFER_NUMBER: ${TRANSFER_NUMBER:-}
       REALTIME_MODEL: ${REALTIME_MODEL:-}
       REALTIME_VOICE: ${REALTIME_VOICE:-}
@@ -24,28 +64,242 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-}
       LOG_TRANSCRIPTS: ${LOG_TRANSCRIPTS:-}
     volumes:
-      # Editing business.yaml only needs a restart, not a rebuild.
+      # Editing business.yaml or pricing.yaml only needs a restart, not a rebuild.
       - ./config:/app/config:ro
     ports:
       - "127.0.0.1:8080:8080"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+    stop_grace_period: 30s
     healthcheck:
-      test:
-        - CMD
-        - /nodejs/bin/node
-        - -e
-        - "fetch('http://127.0.0.1:8080/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      <<: *healthcheck
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:8080/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  knowledge-service:
+    <<: *hardened
+    build:
+      context: .
+      target: service
+      args:
+        SERVICE_DIR: services/knowledge-service
+    image: helpdesk/knowledge-service:dev
+    environment:
+      <<: [*database, *embeddings, *tracing]
+      SEARCH_MIN_SIMILARITY: ${SEARCH_MIN_SIMILARITY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:8081/readyz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    depends_on:
+      ingest:
+        condition: service_completed_successfully
+
+  call-worker:
+    <<: *hardened
+    build:
+      context: .
+      target: service
+      args:
+        SERVICE_DIR: services/call-worker
+    image: helpdesk/call-worker:dev
+    environment:
+      <<: [*database, *tracing]
+      NATS_URL: nats://nats:4222
+      # Mailpit catches every email locally. Set SMTP_URL in .env for real ones.
+      SMTP_URL: ${SMTP_URL:-smtp://mailpit:1025}
+      NOTIFY_EMAIL_TO: ${NOTIFY_EMAIL_TO:-owner@helpdesk.test}
+      NOTIFY_EMAIL_FROM: ${NOTIFY_EMAIL_FROM:-assistant@helpdesk.test}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:9464/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+
+  admin-ui:
+    <<: *hardened
+    build:
+      context: .
+      target: service
+      args:
+        SERVICE_DIR: services/admin-ui
+    image: helpdesk/admin-ui:dev
+    environment:
+      <<: *database
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?run npm run admin:hash and set ADMIN_PASSWORD_HASH in .env}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:?set ADMIN_SESSION_SECRET in .env, at least 32 characters}
+      # Browsers treat localhost as secure, but curl and plain HTTP tools don't.
+      ADMIN_COOKIE_SECURE: "false"
+      JAEGER_UI_URL: http://localhost:16686
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    ports:
+      - "127.0.0.1:8082:8082"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:8082/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot jobs. Both exit once they have finished.
+  migrate:
+    build:
+      context: .
+      target: ingest-job
+      args:
+        SERVICE_DIR: services/ingest-job
+    image: helpdesk/ingest-job:dev
+    command: ["packages/db/dist/cli.js"]
+    environment:
+      <<: *database
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ingest:
+    build:
+      context: .
+      target: ingest-job
+      args:
+        SERVICE_DIR: services/ingest-job
+    image: helpdesk/ingest-job:dev
+    environment:
+      <<: [*database, *embeddings]
+      KNOWLEDGE_DIR: /knowledge
+      LOG_LEVEL: ${LOG_LEVEL:-}
+    volumes:
+      # Your own files, so editing them only needs `docker compose run --rm ingest`.
+      - ./knowledge:/knowledge:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # --- Infrastructure -------------------------------------------------------
+
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: helpdesk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-helpdesk-dev}
+      POSTGRES_DB: helpdesk
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U helpdesk"]
+
+  nats:
+    image: nats:2.15.2-alpine
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    volumes:
+      - nats-data:/data
+    ports:
+      - "127.0.0.1:8222:8222"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+
+  mailpit:
+    image: axllent/mailpit:v1.33.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8025:8025"
+
+  # --- Observability --------------------------------------------------------
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.163.2
+    restart: unless-stopped
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./deploy/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16686:16686"
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.20.3
+    restart: unless-stopped
+    command: ["-varz", "-jsz=all", "http://nats:8222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: mailpit:1025
+      GF_SMTP_FROM_ADDRESS: grafana@helpdesk.test
+      ALERT_EMAIL_TO: ${NOTIFY_EMAIL_TO:-owner@helpdesk.test}
+      PROMETHEUS_URL: http://prometheus:9090
+      JAEGER_URL: http://jaeger:16686
+    volumes:
+      - ./deploy/helm/helpdesk/files/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/helm/helpdesk/files/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+  # --- Optional, switched on by COMPOSE_PROFILES ----------------------------
+
+  # Fake OpenAI and fake Twilio, plus a test phone at http://localhost:9000.
+  sim:
+    <<: *hardened
+    profiles: [sim]
+    build:
+      context: .
+      target: service
+      args:
+        SERVICE_DIR: tools/sim
+    image: helpdesk/sim:dev
+    environment:
+      GATEWAY_URL: http://call-gateway:8080
+      PUBLIC_BASE_URL: https://${NGROK_DOMAIN:?set NGROK_DOMAIN in .env}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:?set TWILIO_ACCOUNT_SID in .env}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:?set TWILIO_AUTH_TOKEN in .env}
+      SIM_AI: ${SIM_AI:-fake}
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:9000/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
 
   ngrok:
     image: ngrok/ngrok:3
+    profiles: [tunnel]
     restart: unless-stopped
     command:
       - http
@@ -59,3 +313,9 @@ services:
     depends_on:
       call-gateway:
         condition: service_healthy
+
+volumes:
+  postgres-data:
+  nats-data:
+  prometheus-data:
+  grafana-data:

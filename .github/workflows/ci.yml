@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TRIVY_VERSION: v0.76.1
+  HELM_VERSION: v4.3.1
+
+# Every action is pinned to a full commit SHA. Tags can be moved: in March 2026
+# attackers repointed the trivy-action tags at credential-stealing code
+# (CVE-2026-33634). Update a SHA only after checking it against the official repo.
+
+jobs:
+  check:
+    name: Lint, typecheck and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run typecheck
+      # Runs the unit tests too, with real Postgres and NATS for the rest.
+      - run: npm run test:integration
+
+  image:
+    name: Build and scan ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: call-gateway, dir: services/call-gateway, target: service }
+          - { name: knowledge-service, dir: services/knowledge-service, target: service }
+          - { name: call-worker, dir: services/call-worker, target: service }
+          - { name: admin-ui, dir: services/admin-ui, target: service }
+          - { name: ingest-job, dir: services/ingest-job, target: ingest-job }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          build-args: SERVICE_DIR=${{ matrix.dir }}
+          tags: helpdesk/${{ matrix.name }}:ci
+          load: true
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: helpdesk/${{ matrix.name }}:ci
+          severity: HIGH,CRITICAL
+          # A CVE with no fix available can't be acted on, and would block every PR.
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
+
+  scan:
+    name: Scan code, secrets and infrastructure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan dependencies and secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Render the chart
+        run: |
+          bash deploy/helm/fetch-charts.sh
+          mkdir -p rendered
+          # Only our own templates. Third-party charts are the upstream project's to fix.
+          helm template helpdesk deploy/helm/helpdesk --namespace helpdesk \
+            --values deploy/helm/helpdesk/values-k3d.yaml \
+            --set-string secrets.values.ADMIN_PASSWORD_HASH=unused \
+            --show-only templates/call-gateway.yaml \
+            --show-only templates/services.yaml \
+            --show-only templates/infrastructure.yaml \
+            --show-only templates/ingest.yaml \
+            --show-only templates/networkpolicies.yaml \
+            > rendered/helpdesk.yaml
+          cp Dockerfile rendered/Dockerfile
+      - name: Scan Kubernetes manifests and Dockerfile
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: rendered
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          trivyignores: .trivyignore
+
+  end-to-end:
+    name: Simulated call through the whole system
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm run sim:up
+      - run: npm run sim:call
+      - run: npm run sim:verify
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose --env-file deploy/sim/sim.env logs --tail 80
+
+  publish:
+    name: Push ${{ matrix.name }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, image, scan, end-to-end]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { name: call-gateway, dir: services/call-gateway, target: service }
+          - { name: knowledge-service, dir: services/knowledge-service, target: service }
+          - { name: call-worker, dir: services/call-worker, target: service }
+          - { name: admin-ui, dir: services/admin-ui, target: service }
+          - { name: ingest-job, dir: services/ingest-job, target: ingest-job }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Work out the image name
+        id: name
+        # Registries require lowercase, and GitHub owners may not be.
+        run: echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ github.repository_owner }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          build-args: SERVICE_DIR=${{ matrix.dir }}
+          tags: ghcr.io/${{ steps.name.outputs.owner }}/helpdesk/${{ matrix.name }}:${{ github.sha }}
+          push: true
+          cache-from: type=gha,scope=${{ matrix.name }}
+
+  deploy:
+    name: Deploy to k3s
+    # Off until the repository variable DEPLOY_ENABLED is set to true.
+    if: vars.DEPLOY_ENABLED == 'true'
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+      # The cluster API stays private, and CI reaches it over a private network.
+      - uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - name: Write kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      - name: Work out the image name
+        id: name
+        run: echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ github.repository_owner }}
+      - name: Upgrade the release
+        # The timeout covers the longest call, because old pods wait for theirs to finish.
+        run: |
+          bash deploy/helm/fetch-charts.sh
+          helm upgrade --install helpdesk deploy/helm/helpdesk \
+            --namespace helpdesk --create-namespace \
+            --set image.registry="ghcr.io/${{ steps.name.outputs.owner }}/helpdesk" \
+            --set image.tag="$GITHUB_SHA" \
+            --set callGateway.publicBaseUrl="https://$PUBLIC_HOST" \
+            --set callGateway.ingress.host="$PUBLIC_HOST" \
+            --set-string callGateway.transferNumber="$TRANSFER_NUMBER" \
+            --set callWorker.notifyEmailTo="$NOTIFY_EMAIL_TO" \
+            --set callWorker.notifyEmailFrom="$NOTIFY_EMAIL_FROM" \
+            --wait --rollback-on-failure --timeout 15m
+        env:
+          PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
+          TRANSFER_NUMBER: ${{ vars.TRANSFER_NUMBER }}
+          NOTIFY_EMAIL_TO: ${{ vars.NOTIFY_EMAIL_TO }}
+          NOTIFY_EMAIL_FROM: ${{ vars.NOTIFY_EMAIL_FROM }}

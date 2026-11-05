@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@fastify/formbody": "^9.0.1",
+    "@helpdesk/broker": "*",
     "@helpdesk/shared": "*",
     "fastify": "^5.12.8",
     "twilio": "^6.2.0",

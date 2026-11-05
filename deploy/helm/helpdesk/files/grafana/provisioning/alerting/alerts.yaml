@@ -1,0 +1,113 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: helpdesk-email
+    receivers:
+      - uid: helpdesk-email
+        type: email
+        settings:
+          addresses: $ALERT_EMAIL_TO
+
+policies:
+  - orgId: 1
+    receiver: helpdesk-email
+    group_by: [alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+
+groups:
+  - orgId: 1
+    name: helpdesk
+    folder: Helpdesk
+    interval: 1m
+    rules:
+      - uid: helpdesk-error-rate
+        title: High error rate
+        condition: threshold
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: The system is logging errors faster than 6 a minute. Calls may be failing.
+        data:
+          - refId: errors
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: errors
+              instant: true
+              # Each term needs "or vector(0)": a service with no errors yet has no
+              # series, and adding nothing to a number gives nothing, not the number.
+              expr: >-
+                (sum(rate(helpdesk_errors_total[5m])) or vector(0))
+                + (sum(rate(helpdesk_events_processed_total{outcome="error"}[5m])) or vector(0))
+                + (sum(rate(helpdesk_search_requests_total{outcome="error"}[5m])) or vector(0))
+          - refId: threshold
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: errors
+              conditions:
+                - evaluator: { type: gt, params: [0.1] }
+
+      - uid: helpdesk-high-latency
+        title: Slow agent replies
+        condition: threshold
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: Over 5 minutes, 95% of replies took more than 2 seconds to start. Callers will notice.
+        data:
+          - refId: latency
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: latency
+              instant: true
+              expr: histogram_quantile(0.95, sum by (le) (rate(helpdesk_realtime_first_audio_seconds_bucket[5m])))
+          - refId: threshold
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: latency
+              conditions:
+                - evaluator: { type: gt, params: [2] }
+
+      - uid: helpdesk-dead-letters
+        title: Events reaching the dead-letter queue
+        condition: threshold
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: Events are failing for good and need looking at. Check the worker logs and the HELPDESK_DLQ stream.
+        data:
+          - refId: dead
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: dead
+              instant: true
+              expr: sum(increase(helpdesk_dead_letters_total[10m]))
+          - refId: threshold
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: dead
+              conditions:
+                - evaluator: { type: gt, params: [0] }

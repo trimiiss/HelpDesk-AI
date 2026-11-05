@@ -1,0 +1,19 @@
+# Applied once per cluster: kubectl apply -f deploy/k3s/traefik-config.yaml
+#
+# A phone call is a WebSocket that stays open for minutes, so the usual HTTP
+# timeouts must not apply. The grace period lets Traefik restart without cutting
+# off calls that are in progress.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    additionalArguments:
+      - --entryPoints.web.transport.respondingTimeouts.readTimeout=0s
+      - --entryPoints.web.transport.respondingTimeouts.idleTimeout=0s
+      - --entryPoints.websecure.transport.respondingTimeouts.readTimeout=0s
+      - --entryPoints.websecure.transport.respondingTimeouts.idleTimeout=0s
+      - --entryPoints.web.transport.lifeCycle.graceTimeOut=660s
+      - --entryPoints.websecure.transport.lifeCycle.graceTimeOut=660s

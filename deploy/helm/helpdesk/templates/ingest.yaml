@@ -1,0 +1,72 @@
+{{/*
+Migrating and indexing runs as a plain Job, not a Helm hook. Hooks can't work
+here: a pre-install hook would run before the dev Postgres exists, and a
+post-install hook would wait on knowledge-service, which can't become ready until
+the index exists. The Job retries until the database is up, and the revision in
+its name gives each release a fresh one, since a Job can't be changed in place.
+*/}}
+{{- define "helpdesk.ingestPod" -}}
+metadata:
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+    {{- include "helpdesk.selector" "ingest-job" | nindent 4 }}
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    {{- include "helpdesk.podSecurity" . | nindent 4 }}
+  initContainers:
+    - name: migrate
+      image: {{ include "helpdesk.image" (dict "root" . "name" "ingest-job") }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args: ["packages/db/dist/cli.js"]
+      securityContext:
+        {{- include "helpdesk.containerSecurity" . | nindent 8 }}
+      env:
+        {{- include "helpdesk.secretEnv" (dict "root" . "name" "DATABASE_URL") | nindent 8 }}
+      resources:
+        {{- toYaml .Values.ingest.resources | nindent 8 }}
+  containers:
+    - name: ingest
+      image: {{ include "helpdesk.image" (dict "root" . "name" "ingest-job") }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext:
+        {{- include "helpdesk.containerSecurity" . | nindent 8 }}
+      env:
+        - name: KNOWLEDGE_DIR
+          value: /knowledge
+        - name: LOG_LEVEL
+          value: {{ .Values.logLevel | quote }}
+        {{- include "helpdesk.embeddingEnv" . | nindent 8 }}
+        {{- include "helpdesk.secretEnv" (dict "root" . "name" "DATABASE_URL") | nindent 8 }}
+      resources:
+        {{- toYaml .Values.ingest.resources | nindent 8 }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingest-{{ .Release.Revision }}
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 3600
+  template:
+    {{- include "helpdesk.ingestPod" . | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ingest
+  labels:
+    {{- include "helpdesk.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.ingest.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        {{- include "helpdesk.ingestPod" . | nindent 8 }}
